@@ -7,14 +7,14 @@ from aiohttp_socks import ProxyConnector
 import time
 import random
 import os
-import resource  # Permet de surveiller l'utilisation de la RAM sur Linux/Render
+import resource
 
 app = Flask(__name__)
 CORS(app)
 
 # --- CONFIGURATION LIMITES DE SÉCURITÉ ---
-MAX_ALLOWED_CONNECTIONS = 350  # Limite matérielle pour ne pas saturer 512Mo de RAM
-RAM_LIMIT_MB = 460  # Seuil d'alerte RAM (on coupe à 460Mo pour garder une marge de sécurité)
+MAX_ALLOWED_CONNECTIONS = 350
+RAM_LIMIT_MB = 460
 
 test_en_cours = False
 stats = {
@@ -36,26 +36,27 @@ headers_globaux = {
     "Connection": "keep-alive"
 }
 
-# Un seul connecteur global standard pour éviter de recréer des objets lourds en mémoire
-GLOBAL_CONNECTOR = aiohttp.TCPConnector(force_close=False, enable_cleanup_closed=True, limit=None)
+# Suppression des variables globales de connecteurs à l'initialisation pour éviter le conflit d'Event Loop
+GLOBAL_CONNECTOR = None
 SESSIONS_POOL = {}
 
 def get_current_ram_usage():
-    """Retourne l'utilisation actuelle de la RAM par ce script en Mo"""
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Sur Linux, ru_maxrss est en Ko. On convertit en Mo.
     return usage / 1024
 
 async def get_session_for_proxy(proxy_url):
     global SESSIONS_POOL, headers_globaux, GLOBAL_CONNECTOR
+    
     if proxy_url in SESSIONS_POOL:
         return SESSIONS_POOL[proxy_url]
     
-    # On limite la création de sessions SOCKS5 uniques pour ne pas saturer la mémoire
     if proxy_url and proxy_url.startswith("socks5://"):
-        if len(SESSIONS_POOL) > 50:  # Si trop de sessions de proxys ouvertes, on nettoie pour libérer la RAM
+        if len(SESSIONS_POOL) > 50:
             for sess in list(SESSIONS_POOL.values()):
-                await sess.close()
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
             SESSIONS_POOL.clear()
         
         connector = ProxyConnector.from_url(proxy_url, rdns=True)
@@ -63,9 +64,13 @@ async def get_session_for_proxy(proxy_url):
         SESSIONS_POOL[proxy_url] = session
         return session
     else:
-        # Pour les requêtes sans proxy ou HTTP standards, on utilise une session globale unique ultra-légère
-        if "global" not in SESSIONS_POOL:
+        # Initialisation du connecteur uniquement à la demande, à l'intérieur de la boucle active
+        if GLOBAL_CONNECTOR is None or GLOBAL_CONNECTOR.closed:
+            GLOBAL_CONNECTOR = aiohttp.TCPConnector(force_close=False, enable_cleanup_closed=True, limit=None)
+            
+        if "global" not in SESSIONS_POOL or SESSIONS_POOL["global"].closed:
             SESSIONS_POOL["global"] = aiohttp.ClientSession(connector=GLOBAL_CONNECTOR, headers=headers_globaux)
+            
         return SESSIONS_POOL["global"]
 
 async def fetch(url, security_enabled):
@@ -103,19 +108,18 @@ async def fetch(url, security_enabled):
 async def worker(url, security_enabled):
     while test_en_cours:
         await fetch(url, security_enabled)
-        await asyncio.sleep(0.005)  # Légèrement augmenté (0.005s) pour laisser respirer le CPU et la RAM de Render
+        await asyncio.sleep(0.005)
 
 async def start_async_test(url, max_connections, duration, security_enabled):
-    global test_en_cours, stats, stopped_by_safety, SESSIONS_POOL
+    global test_en_cours, stats, stopped_by_safety, SESSIONS_POOL, GLOBAL_CONNECTOR
     test_en_cours = True
     stopped_by_safety = False
     stats = {"succes": 0, "bloque": 0, "erreurs": 0, "total_envoye": 0, "vitesse": 0, "latence_moyenne": 0}
     
-    # Sécurité matérielle : On bride le nombre de tâches pour éviter l'explosion de la RAM
-    connexions_bridées = min(int(max_connections), MAX_ALLOWED_CONNECTIONS)
+    connexions_brisees = min(int(max_connections), MAX_ALLOWED_CONNECTIONS)
     
     start_time = time.time()
-    tasks = [asyncio.create_task(worker(url, security_enabled)) for i in range(connexions_bridées)]
+    tasks = [asyncio.create_task(worker(url, security_enabled)) for i in range(connexions_brisees)]
     
     while time.time() - start_time < int(duration) and test_en_cours:
         await asyncio.sleep(0.5)
@@ -123,7 +127,6 @@ async def start_async_test(url, max_connections, duration, security_enabled):
         if elapsed > 0:
             stats["vitesse"] = int(stats["total_envoye"] / elapsed)
             
-        # 🚨 VÉRIFICATION DE LA RAM EN TEMPS RÉEL
         if get_current_ram_usage() > RAM_LIMIT_MB:
             print(f"[ALERTE] Saturation RAM évitée ({get_current_ram_usage():.1f}Mo). Arrêt d'urgence.")
             test_en_cours = False
@@ -133,13 +136,26 @@ async def start_async_test(url, max_connections, duration, security_enabled):
     for task in tasks:
         task.cancel()
         
-    # Nettoyage agressif de la mémoire en fin de test
+    # Nettoyage complet
     for sess in list(SESSIONS_POOL.values()):
-        await sess.close()
+        try:
+            await sess.close()
+        except Exception:
+            pass
     SESSIONS_POOL.clear()
+    
+    if GLOBAL_CONNECTOR and not GLOBAL_CONNECTOR.closed:
+        await GLOBAL_CONNECTOR.close()
+    GLOBAL_CONNECTOR = None
 
 def run_async_loop(url, connections, duration, security_enabled):
-    asyncio.run(start_async_test(url, connections, duration, security_enabled))
+    # Utilisation d'une nouvelle boucle propre pour chaque thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(start_async_test(url, connections, duration, security_enabled))
+    finally:
+        loop.close()
 
 # --- ROUTES API ---
 
@@ -171,7 +187,6 @@ def stop():
 
 @app.route('/stats')
 def get_stats():
-    # On ajoute la RAM actuelle dans les logs de la console Render pour surveiller
     current_ram = get_current_ram_usage()
     if current_ram > 400:
         print(f"[WARN] Utilisation RAM élevée : {current_ram:.1f} Mo")
